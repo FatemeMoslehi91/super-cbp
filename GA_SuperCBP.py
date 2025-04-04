@@ -1,156 +1,157 @@
-import pandas as pd
-import h5py
 import numpy as np
-from sklearn.cluster import MiniBatchKMeans
+import pandas as pd
+import random
+import time
+from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score
-from sklearn.metrics import roc_auc_score
-import signal
-from contextlib import contextmanager
-import logging
-import os
-import platform
-import threading
-from threading import Timer
-import time
-import sys
+from scipy.stats import pearsonr
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('ga_algorithm.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
 
-# Set environment variables
-os.environ['OMP_NUM_THREADS'] = '2'
+# Import helper function for loading data
+from helper_func import load_junifer_store
 
-# File paths for cluster
-CLUSTER_DATA_PATH = "/home/fmoslehi/data"  
-CLUSTER_OUTPUT_PATH = "/home/fmoslehi/output"  
+# File paths
+hipp_store_name = "HCP_R1_LR_VoxExtr_TianHip.hdf5"  # Hippocampus data
+roi_store_name = "HCP_R1_LR_ROIExtr_Power.hdf5"     # ROI data
+data_path = "E:/INM-7/SuperCBP/Data"
+labels_path = "E:/INM-7/SuperCBP/Data/hcp_ya_395unrelated_info.csv"  # Gender labels
 
-class TimeoutException(Exception):
-    pass
 
-@contextmanager
-def timeout(seconds):
-    if platform.system() == 'Windows':
-        # Windows implementation using Timer
-        timer = Timer(seconds, lambda: threading.current_thread().interrupt_main())
-        timer.start()
-        try:
-            yield
-        except KeyboardInterrupt:
-            raise TimeoutException("Timed out!")
-        finally:
-            timer.cancel()
-    else:
-        # Linux/Unix implementation using SIGALRM
-        def signal_handler(signum, frame):
-            raise TimeoutException("Timed out!")
-        
-        # Register a signal handler
-        signal.signal(signal.SIGALRM, signal_handler)
-        signal.alarm(seconds)
-        try:
-            yield
-        finally:
-            signal.alarm(0)
-
-def load_partial_time_series(file_path, dataset_path):
+def initialize_population(pop_size, num_clusters, brain_bounds):
     """
-    Load time series from an HDF5 file.
-    """
-    time_series = []
-    with h5py.File(file_path, "r") as f:
-        keys = list(f[dataset_path].keys())
-        for idx_name in keys:
-            dataset_full_path = f"{dataset_path}/{idx_name}"
-            if isinstance(f[dataset_full_path], h5py.Dataset):
-                data = f[dataset_full_path][:]
-                time_series.append(data)
-    return np.array(time_series)
-
-def compute_feature_space(cluster_centers, roi_time_series):
-    """
-    Compute feature space using correlations between cluster centers and ROI time series.
-    """
-    n_clusters = cluster_centers.shape[0]
-    n_rois = roi_time_series.shape[2]
-    n_subjects = roi_time_series.shape[0]
-    features = np.zeros((n_clusters, n_rois, n_subjects))
-
-    for i in range(n_clusters):
-        for j in range(n_rois):
-            for k in range(n_subjects):
-                cluster_ts = np.mean(cluster_centers[i, :, :], axis=1)
-                roi_ts = roi_time_series[k, :, j]
-                correlation = np.corrcoef(cluster_ts, roi_ts)[0, 1]
-                features[i, j, k] = correlation
-
-    return features
-
-def initialize_population(pop_size, num_clusters, brain_bounds, hip_time_series):
-    """
-    Generate initial population of chromosomes.
-    Each chromosome represents cluster centers.
+    Generates an initial population of chromosomes.
+    
+    :param pop_size: Number of individuals in the population.
+    :param num_clusters: Number of clusters (K).
+    :param brain_bounds: Min and max coordinates (x, y, z) in brain space.
+                       Format: [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+    :returns: List of population's chromosomes, each chromosome is a numpy array
+             of shape (num_clusters * 3,) representing K cluster centers in 3D space.
     """
     population = []
-    min_bound, max_bound = brain_bounds
     
-    # Calculate number of features dynamically from data shape
-    n_features = hip_time_series.shape[1] * hip_time_series.shape[2]
-    
-    
-    # Use current time as seed for random number generation
-    np.random.seed(int(time.time() * 1000) % 10000)
+    # Extract min and max bounds for each dimension
+    min_bound = np.repeat([bound[0] for bound in brain_bounds], num_clusters)  # Repeat for each cluster
+    max_bound = np.repeat([bound[1] for bound in brain_bounds], num_clusters)  # Repeat for each cluster
     
     for _ in range(pop_size):
-        # Each chromosome represents cluster centers with proper number of features
+        # Each chromosome represents num_clusters centers
+        # Each center has 3 coordinates (X, Y, Z)
         chromosome = np.random.uniform(
             low=min_bound,
             high=max_bound,
-            size=(num_clusters * n_features)  # Each cluster center has n_features dimensions
+            size=(num_clusters * 3)  # num_clusters * 3 (X,Y,Z)
         )
         population.append(chromosome)
     
     return population
 
-def tournament_selection(population, fitness_scores, num_parents, tournament_size=3):
+def get_brain_bounds(storage_name="HCP_R1_LR_VoxExtr_TianHip.hdf5", data_path="E:/INM-7/SuperCBP/Data"):
+    """
+    Extract brain coordinate bounds from the HDF5 storage file.
+    
+    :param storage_name: Name of the HDF5 file
+    :param data_path: Path to the data directory
+    :returns: List of [min, max] bounds for each dimension [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+    """
+    # Load the storage file
+    storage, marker_names = load_junifer_store(storage_name, data_path)
+    
+    # Load data from the first feature to get voxel coordinates
+    vox_sig = storage.read_df(feature_name=marker_names[0])
+    
+    # Get coordinates from column labels (which are stored as string tuples)
+    coordinates = [eval(col) for col in vox_sig.columns]
+    coordinates = np.array(coordinates)  # Convert to numpy array for easier operations
+    
+    # Extract x, y, z coordinates
+    x_coords = coordinates[:, 0]
+    y_coords = coordinates[:, 1]
+    z_coords = coordinates[:, 2]
+    
+    # Calculate bounds for each dimension
+    brain_bounds = [
+        [np.min(x_coords), np.max(x_coords)],  # x bounds
+        [np.min(y_coords), np.max(y_coords)],  # y bounds
+        [np.min(z_coords), np.max(z_coords)]   # z bounds
+    ]
+    
+    print("Brain bounds extracted from voxel coordinates:")
+    print(f"X range: [{brain_bounds[0][0]}, {brain_bounds[0][1]}]")
+    print(f"Y range: [{brain_bounds[1][0]}, {brain_bounds[1][1]}]")
+    print(f"Z range: [{brain_bounds[2][0]}, {brain_bounds[2][1]}]")
+    
+    return brain_bounds
+
+
+
+def tournament_selection(population, fitness_scores, num_parents, tournsize=2):
     """
     Select parents using tournament selection.
+    
+    :param population: List of chromosomes in the current generation.
+    :param fitness_scores: Corresponding fitness scores for each chromosome.
+    :param num_parents: Number of parents to be selected.
+    :param tournsize: Size of each tournament.
+    :return: List of selected parent chromosomes.
     """
     selected_parents = []
-    population_size = len(population)
     
-    while len(selected_parents) < num_parents:
-        tournament_indices = np.random.choice(population_size, tournament_size, replace=False)
-        tournament_fitness = [fitness_scores[i] for i in tournament_indices]
-        winner_idx = tournament_indices[np.argmax(tournament_fitness)]
+    # Convert fitness scores to numpy array
+    fitness_scores = np.array(fitness_scores)
+    
+    for _ in range(num_parents):
+        # Randomly select tournsize individuals
+        aspirants_idx = [random.randint(0, len(population) - 1) for _ in range(tournsize)]
+        
+        # Select the one with the highest fitness
+        aspirants_fitness = [fitness_scores[i] for i in aspirants_idx]
+        winner_idx = aspirants_idx[np.argmax(aspirants_fitness)]
+        
+        # Add the winner to the selected parents
         selected_parents.append(population[winner_idx])
     
     return selected_parents
 
-def crossover(parent1, parent2):
+def crossover(parent1, parent2, crossover_rate=0.8):
     """
-    Perform crossover between two parent chromosomes.
+    Perform single-point crossover between two parents.
+    
+    :param parent1: First parent chromosome.
+    :param parent2: Second parent chromosome.
+    :param crossover_rate: Probability of performing crossover.
+    :return: Tuple containing two offspring chromosomes.
     """
-    parent1, parent2 = np.array(parent1), np.array(parent2)
-    if len(parent1) != len(parent2):
-        raise ValueError("Parent chromosomes must have the same length")
+    # Create copies of parents
+    parent1 = np.array(parent1)
+    parent2 = np.array(parent2)
+    offspring1 = parent1.copy()
+    offspring2 = parent2.copy()
     
-    crossover_point = (len(parent1) // 2) // 3 * 3
-    child1 = np.concatenate([parent1[:crossover_point], parent2[crossover_point:]])
-    child2 = np.concatenate([parent2[:crossover_point], parent1[crossover_point:]])
+    # Determine whether to perform crossover
+    if random.random() < crossover_rate:
+        # Choose a random crossover point
+        crossover_point = random.randint(1, len(parent1) - 1)
+        
+        # Perform crossover (properly handle numpy arrays)
+        offspring1 = np.concatenate((parent1[:crossover_point], parent2[crossover_point:]))
+        offspring2 = np.concatenate((parent2[:crossover_point], parent1[crossover_point:]))
     
-    return child1, child2
+    return offspring1, offspring2
 
-def mutate(chromosome, mutation_rate=0.1, mutation_strength=5.0, brain_bounds=None):
+
+
+def mutation(chromosome, mutation_rate=0.1, mutation_strength=5.0, brain_bounds=None):
     """
     Mutate a chromosome by shifting cluster centers.
+    :param chromosome: The chromosome to be mutated.
+    :param mutation_rate: Probability of each gene being mutated.
+    :param mutation_strength: Scale of the mutation if using Gaussian mutation.
+    :param brain_bounds: Min and max coordinates (x, y, z) in brain space.
+                      Format: [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+    :return: Mutated chromosome.
+    
     """
     mutated = chromosome.copy()
     
@@ -165,234 +166,309 @@ def mutate(chromosome, mutation_rate=0.1, mutation_strength=5.0, brain_bounds=No
     
     return mutated
 
-def evaluate_fitness(chromosome, roi_time_series, hip_time_series, n_clusters, run_number, generation_number, chromosome_number):
+def decode_chromosome(chromosome, num_clusters=3):
     """
-    Evaluate clustering quality using classification AUC.
+    Decode a chromosome into cluster centers.
+    
+    :param chromosome: List of values representing cluster centers.
+    :param num_clusters: Number of clusters.
+    :return: Numpy array of shape (num_clusters, 3) representing cluster centers.
     """
+    # Reshape the chromosome into cluster centers
+    centers = np.array(chromosome).reshape(num_clusters, 3)
+    return centers
+
+def calculate_cluster_time_series(vox_data, cluster_labels, n_clusters=3):
+    """
+    Calculate average time series for each cluster for each subject.
+    
+    :param vox_data: DataFrame containing voxel time series.
+    :param cluster_labels: Array of cluster assignments for each voxel.
+    :param n_clusters: Number of clusters.
+    :return: Dictionary with subject IDs as keys and time series arrays as values.
+    """
+    cluster_time_series = {}
+    subjects = vox_data.index.get_level_values('subject').unique()
+    
+    for subject_id in subjects:
+        # Extract data for this subject
+        subject_data = vox_data.xs(subject_id, level='subject')
+        
+        # Calculate average signal for each cluster
+        cluster_signals = []
+        for cluster_id in range(n_clusters):
+            voxel_indices = np.where(cluster_labels == cluster_id)[0]
+            cluster_voxels = subject_data.iloc[:, voxel_indices]
+            avg_signal = cluster_voxels.mean(axis=1)
+            cluster_signals.append(avg_signal)
+        
+        # Stack to form (time_points, n_clusters)
+        cluster_time_series[subject_id] = np.column_stack(cluster_signals)
+    
+    return cluster_time_series
+
+def build_feature_matrix(cluster_time_series, roi_data):
+    """
+    Build feature matrix from cluster and ROI time series correlations.
+    
+    :param cluster_time_series: Dictionary with subject IDs as keys and cluster time series as values.
+    :param roi_data: Array of ROI time series of shape (n_subjects, n_timepoints, n_rois).
+    :return: Feature matrix of shape (n_subjects, n_clusters * n_rois).
+    """
+    # Sort subject IDs for consistency
+    subject_ids = sorted(cluster_time_series.keys())
+    n_subjects = len(subject_ids)
+    
+    # Get dimensions
+    n_clusters = cluster_time_series[subject_ids[0]].shape[1]
+    _, _, n_rois = roi_data.shape
+    
+    # Initialize feature matrix
+    X = np.zeros((n_subjects, n_clusters * n_rois))
+    
+    for i, subject_id in enumerate(subject_ids):
+        cluster_ts = cluster_time_series[subject_id]
+        roi_ts = roi_data[i]
+        
+        # Calculate correlations
+        feat_idx = 0
+        for c_idx in range(n_clusters):
+            c_signal = cluster_ts[:, c_idx]
+            for r_idx in range(n_rois):
+                r_signal = roi_ts[:, r_idx]
+                
+                # Calculate correlation
+                try:
+                    corr, _ = pearsonr(c_signal, r_signal)
+                    if np.isnan(corr):
+                        corr = 0.0
+                except:
+                    corr = 0.0
+                
+                X[i, feat_idx] = corr
+                feat_idx += 1
+    
+    return X
+
+def evaluate_fitness(chromosome, vox_data, voxel_coords, roi_data, labels, num_clusters=3):
+    """
+    Evaluate the fitness of a chromosome.
+    
+    :param chromosome: Chromosome to evaluate.
+    :param vox_data: DataFrame of voxel time series.
+    :param voxel_coords: Array of voxel coordinates.
+    :param roi_data: Array of ROI time series.
+    :param labels: Array of class labels (gender).
+    :param num_clusters: Number of clusters.
+    :return: Fitness score (AUC).
+    """
+    # Convert chromosome to cluster centers
+    centers = decode_chromosome(chromosome, num_clusters)
+    
+    # Print the cluster centers
+    print("  Cluster centers:")
+    for i, center in enumerate(centers):
+        print(f"    Cluster {i+1}: {center}")
+    
+    # Create KMeans model with these centers
+    kmeans = KMeans(n_clusters=num_clusters, init=centers, n_init=1)
+    cluster_labels = kmeans.fit_predict(voxel_coords)
+    
+    # Print the number of voxels in each cluster
+    cluster_counts = np.bincount(cluster_labels)
+    print("  Voxels per cluster:")
+    for i, count in enumerate(cluster_counts):
+        print(f"    Cluster {i+1}: {count} voxels")
+    
+    # Calculate cluster time series
+    cluster_time_series = calculate_cluster_time_series(vox_data, cluster_labels, num_clusters)
+    
+    # Build feature matrix
+    X = build_feature_matrix(cluster_time_series, roi_data)
+    
+    # Evaluate classification performance using cross-validation
+    model = LogisticRegression(max_iter=1000, random_state=42)
     try:
-        with timeout(300):  # 5 minutes timeout
-            logging.info(f"\n{'='*50}")
-            logging.info(f"Run #{run_number} | Generation #{generation_number} | Chromosome #{chromosome_number}")
-            logging.info(f"{'='*50}")
-            
-            # Reshape chromosome into cluster centers
-            n_features = hip_time_series.shape[1] * hip_time_series.shape[2]
-            cluster_centers = chromosome.reshape(n_clusters, n_features)
-            
-            # Perform clustering using the chromosome's cluster centers
-            logging.info("Performing clustering...")
-            
-            # Use a random state based on current time
-            current_random_state = int(time.time() * 1000) % 10000
-            
-            kmeans = MiniBatchKMeans(
-                n_clusters=n_clusters, 
-                random_state=current_random_state, 
-                batch_size=1024,
-                init=cluster_centers,  # Use chromosome's centers as initial centers
-                n_init=1 
-            )
-            
-            # Reshape hip_time_series for MiniBatchKMeans
-            n_subjects = hip_time_series.shape[0]
-            hip_reshaped = hip_time_series.reshape(n_subjects, -1)
-            
-            # Fit  andpredict
-            cluster_labels = kmeans.fit_predict(hip_reshaped)
-            cluster_centers = kmeans.cluster_centers_.reshape(
-                n_clusters, 
-                hip_time_series.shape[1], 
-                hip_time_series.shape[2]
-            )
-            logging.info(f"Cluster centers shape: {cluster_centers.shape}")
-            
-            # Compute feature space
-            logging.info("Computing feature space...")
-            features = compute_feature_space(cluster_centers, roi_time_series)
-            logging.info(f"Feature space shape: {features.shape}")
-            
-            # Reshape features for classification
-            n_clusters = features.shape[0]
-            n_rois = features.shape[1]
-            n_subjects = features.shape[2]
-            X = features.transpose(2, 0, 1).reshape(n_subjects, n_clusters * n_rois)
-            logging.info(f"Feature matrix shape: {X.shape}")
-            
-            # Load gender labels
-            
-            labels_path = "E:/INM-7/SuperCBP/Data/hcp_ya_395unrelated_info.csv"
-            
-           
-            
-            
-            df = pd.read_csv(labels_path)
-            y = (df['Gender'].values == 'F').astype(int)[:n_subjects]
-            
-            # Perform classification with AUC scoring
-            clf = LogisticRegression(random_state=current_random_state, max_iter=1000)
-            scores = cross_val_score(clf, X, y, cv=5, scoring='roc_auc')
-            fitness_score = scores.mean()
-            
-            #logging.info(f"Gender distribution: {pd.Series(y).value_counts()}")
-            #logging.info(f"Cross-validation AUC scores: {scores}")
-            logging.info(f"Fitness score (mean AUC): {fitness_score:.3f}")
-            logging.info(f"{'='*50}\n")
-            
-            return fitness_score
-            
-    except TimeoutException:
-        logging.error(f"Fitness evaluation timed out for Run #{run_number} | Generation #{generation_number} | Chromosome #{chromosome_number}")
-        return 0.0
+        scores = cross_val_score(model, X, labels, cv=5, scoring='roc_auc')
+        auc = np.mean(scores)
+        print(f"  Cross-validation AUC scores: {scores}")
     except Exception as e:
-        logging.error(f"Error in fitness evaluation for Run #{run_number} | Generation #{generation_number} | Chromosome #{chromosome_number}: {str(e)}")
-        return 0.0
+        print(f"  Error in evaluation: {str(e)}")
+        # If there's an error in evaluation, return a low fitness
+        scores = np.zeros(5)
+        auc = 0.0
+    
+    return auc
 
-def get_brain_bounds(file_path):
-    """
-    Extract absolute brain bounds from hippocampus HDF5 file.
-    """
-    with h5py.File(file_path, "r") as f:
-        tianhip_path = "29f4c47760bd4864566a2095aa473237/key_data"
-        keys = list(f[tianhip_path].keys())
-        all_data = []
-        
-        for idx_name in keys:
-            dataset_full_path = f"{tianhip_path}/{idx_name}"
-            if isinstance(f[dataset_full_path], h5py.Dataset):
-                data = f[dataset_full_path][:]
-                all_data.append(data)
-        
-        all_data = np.array(all_data)
-        absolute_min = np.min(all_data)
-        absolute_max = np.max(all_data)
-        
-        print(f"Absolute minimum bound: {absolute_min}")
-        print(f"Absolute maximum bound: {absolute_max}")
-        return [absolute_min, absolute_max]
+def load_data():
+    """Load and prepare data for the genetic algorithm."""
+    print("Loading hippocampal voxel data...")
+    hipp_storage, hipp_markers = load_junifer_store(hipp_store_name, data_path)
+    vox_data = hipp_storage.read_df(feature_name=hipp_markers[0])
+    
+    # Extract voxel coordinates
+    voxel_coords = np.array([eval(col) for col in vox_data.columns])
+    print(f"Loaded {len(voxel_coords)} voxels from {len(vox_data.index.get_level_values('subject').unique())} subjects")
+    
+    print("\nLoading ROI data...")
+    roi_storage, roi_markers = load_junifer_store(roi_store_name, data_path)
+    roi_df = roi_storage.read_df(feature_name=roi_markers[0])
+    
+    # Convert to numpy array with shape (n_subjects, n_timepoints, n_rois)
+    roi_subjects = roi_df.index.get_level_values('subject').unique()
+    time_points = len(roi_df.xs(roi_subjects[0], level='subject'))
+    n_rois = roi_df.shape[1]
+    
+    roi_data = np.zeros((len(roi_subjects), time_points, n_rois))
+    for i, sid in enumerate(roi_subjects):
+        subj_data = roi_df.xs(sid, level='subject')
+        roi_data[i] = subj_data.values
+    
+    print(f"Loaded ROI data: shape = {roi_data.shape}")
+    
+    print("\nLoading gender labels...")
+    df = pd.read_csv(labels_path)
+    n_subjects = len(roi_subjects)
+    labels = (df['Gender'].values == 'F').astype(int)[:n_subjects]
+    print(f"Loaded {len(labels)} gender labels")
+    
+    return vox_data, voxel_coords, roi_data, labels
 
-def genetic_algorithm(file_path_hip, file_path_roi, pop_size=50, num_clusters=3, 
-                     num_generations=100, mutation_rate=0.1, mutation_strength=5.0, run_number=1):
+def genetic_algorithm(
+    pop_size,
+    num_clusters,
+    num_generations,
+    crossover_rate,
+    mutation_rate,
+    mutation_strength,
+    tournament_size
+):
+    
     """
-    Main genetic algorithm function.
+    Run the genetic algorithm to optimize cluster centers.
+    
+    :param pop_size: Population size.
+    :param num_clusters: Number of clusters.
+    :param num_generations: Number of generations to run.
+    :param crossover_rate: Probability of crossover.
+    :param mutation_rate: Probability of mutation for each gene.
+    :param mutation_strength: Scale of mutation.
+    :param tournament_size: Size of tournament for selection.
+    :return: Best chromosome and its fitness.
     """
-    logging.info(f"\n{'#'*70}")
-    logging.info(f"Starting Run #{run_number}")
-    logging.info(f"Population Size: {pop_size} | Number of Clusters: {num_clusters}")
-    logging.info(f"Number of Generations: {num_generations}")
-    logging.info(f"Mutation Rate: {mutation_rate} | Mutation Strength: {mutation_strength}")
-    logging.info(f"{'#'*70}\n")
+    # Load data
+    vox_data, voxel_coords, roi_data, labels = load_data()
     
-    # Set random seed based on current time
-    np.random.seed(int(time.time() * 1000) % 10000)
-    
-    # Get brain bounds
-    brain_bounds = get_brain_bounds(file_path_hip)
-    
-    # Load time series data
-    tianhip_path = "29f4c47760bd4864566a2095aa473237/key_data"
-    roi_path = "abb7161033609d7db16fe6efcddb123f/key_data"
-    
-    logging.info(f"Loading hip time series from: {file_path_hip}")
-    hip_time_series = load_partial_time_series(file_path_hip, tianhip_path)
-    logging.info(f"Hip time series shape: {hip_time_series.shape}")
-    
-    logging.info(f"Loading ROI time series from: {file_path_roi}")
-    roi_time_series = load_partial_time_series(file_path_roi, roi_path)
-    logging.info(f"ROI time series shape: {roi_time_series.shape}")
+    # Get brain bounds for initialization
+    brain_bounds = get_brain_bounds(hipp_store_name, data_path)
     
     # Initialize population
-    population = initialize_population(pop_size, num_clusters, brain_bounds, hip_time_series)
+    print("\nInitializing population...")
+    population = initialize_population(pop_size, num_clusters, brain_bounds)
     
-    best_fitness = float('-inf')
-    best_chromosome = None
+    # Evaluate initial population
+    print("Evaluating initial population...")
+    fitness_scores = []
+    for i, chrom in enumerate(population):
+        print("\n==================================================")
+        print(f" Generation #1 | Chromosome #{i+1}")
+        print("==================================================")
+        fitness = evaluate_fitness(chrom, vox_data, voxel_coords, roi_data, labels, num_clusters)
+        fitness_scores.append(fitness)
+        print(f"  Chromosome {i+1} fitness: {fitness:.4f}")
     
+    best_fitness = max(fitness_scores)
+    best_idx = fitness_scores.index(best_fitness)
+    best_chromosome = population[best_idx]
+    
+    print(f"\nInitial best fitness: {best_fitness:.4f} (Chromosome {best_idx+1})")
+    
+    # Main GA loop
     for generation in range(num_generations):
-        logging.info(f"\n{'*'*50}")
-        logging.info(f"Run #{run_number} | Generation {generation + 1}/{num_generations}")
-        logging.info(f"{'*'*50}")
+        print(f"\n==================================================")
+        print(f" GENERATION {generation+1}/{num_generations}")
+        print("==================================================")
+        start_time = time.time()
         
-        # Evaluate fitness for each chromosome
-        fitness_scores = []
-        for chromosome_idx, chromosome in enumerate(population):
-            fitness = evaluate_fitness(
-                chromosome, 
-                roi_time_series, 
-                hip_time_series, 
-                num_clusters,
-                run_number,
-                generation + 1,
-                chromosome_idx + 1
-            )
-            fitness_scores.append(fitness)
-            
-            if fitness > best_fitness:
-                best_fitness = fitness
-                best_chromosome = chromosome.copy()
-                logging.info(f"\nNew Best Fitness Found!")
-                logging.info(f"Run #{run_number} | Generation {generation + 1} | Chromosome {chromosome_idx + 1}")
-                logging.info(f"Best Fitness Score: {best_fitness:.3f}")
-        
-        logging.info(f"\nGeneration {generation + 1} Summary:")
-        logging.info(f"Best fitness in generation: {best_fitness:.3f}")
-        logging.info(f"Average fitness: {np.mean(fitness_scores):.3f}")
-        logging.info(f"Min fitness: {np.min(fitness_scores):.3f}")
-        logging.info(f"Max fitness: {np.max(fitness_scores):.3f}")
-        
-        # Selection
-        num_parents = pop_size // 2
-        selected_parents = tournament_selection(population, fitness_scores, num_parents)
-        
-        # Create new population
+        # Create new population through selection, crossover, and mutation
         new_population = []
-        while len(new_population) < pop_size:
-            # Select two different parents using indices
-            parent_indices = np.random.choice(len(selected_parents), 2, replace=False)
-            parent1 = selected_parents[parent_indices[0]]
-            parent2 = selected_parents[parent_indices[1]]
-            
-            # Create children through crossover and mutation
-            child1, child2 = crossover(parent1, parent2)
-            child1 = mutate(child1, mutation_rate, mutation_strength, brain_bounds)
-            child2 = mutate(child2, mutation_rate, mutation_strength, brain_bounds)
-            new_population.extend([child1, child2])
         
-        # Ensure we don't exceed population size
-        population = new_population[:pop_size]
+        # Elitism: Keep the best individual
+        new_population.append(best_chromosome)
+        print(f"Elitism: Keeping best chromosome with fitness {best_fitness:.4f}")
+        
+        # Create the rest of the new population
+        while len(new_population) < pop_size:
+            # Select parents
+            parents = tournament_selection(population, fitness_scores, 2, tournament_size)
+            
+            # Perform crossover
+            if len(parents) >= 2:
+                offspring1, offspring2 = crossover(parents[0], parents[1], crossover_rate)
+                
+                # Perform mutation
+                offspring1 = mutation(offspring1, mutation_rate, mutation_strength)
+                offspring2 = mutation(offspring2, mutation_rate, mutation_strength)
+                
+                # Add to new population
+                new_population.append(offspring1)
+                if len(new_population) < pop_size:
+                    new_population.append(offspring2)
+        
+        # Replace old population
+        population = new_population
+        
+        # Evaluate new population
+        print(f"Evaluating population for generation {generation+1}...")
+        fitness_scores = []
+        for i, chrom in enumerate(population):
+            print("\n==================================================")
+            print(f" Generation #{generation+1} | Chromosome #{i+1}")
+            print("==================================================")
+            fitness = evaluate_fitness(chrom, vox_data, voxel_coords, roi_data, labels, num_clusters)
+            fitness_scores.append(fitness)
+            print(f"  Chromosome {i+1} fitness: {fitness:.4f}")
+        
+        # Update best individual
+        current_best_fitness = max(fitness_scores)
+        current_best_idx = fitness_scores.index(current_best_fitness)
+        
+        if current_best_fitness > best_fitness:
+            best_fitness = current_best_fitness
+            best_chromosome = population[current_best_idx]
+            print(f"\nNew best solution found! Chromosome {current_best_idx+1} with fitness {best_fitness:.4f}")
+        
+        # Print generation statistics
+        generation_time = time.time() - start_time
+        print(f"\nGeneration {generation+1} completed in {generation_time:.2f} seconds")
+        print(f"Best fitness: {best_fitness:.4f}")
+        print(f"Average fitness: {np.mean(fitness_scores):.4f}")
     
-    logging.info(f"\n{'#'*70}")
-    logging.info(f"Run #{run_number} Completed")
-    logging.info(f"Final Best Fitness: {best_fitness:.3f}")
-    logging.info(f"{'#'*70}\n")
+    print("\n==================================================")
+    print(" GENETIC ALGORITHM COMPLETED")
+    print("==================================================")
+    print(f"Best fitness achieved: {best_fitness:.4f}")
     
-    # Save results
-    results_path = os.path.join(CLUSTER_OUTPUT_PATH, f"run_{run_number}_results.npz")
-    np.savez(results_path, 
-             best_chromosome=best_chromosome, 
-             best_fitness=best_fitness)
-    logging.info(f"Results saved to: {results_path}")
+    # Decode the best chromosome into cluster centers
+    best_centers = decode_chromosome(best_chromosome, num_clusters)
+    print("\nBest cluster centers:")
+    for i, center in enumerate(best_centers):
+        print(f"Cluster {i+1}: {center}")
     
     return best_chromosome, best_fitness
 
 if __name__ == "__main__":
-    # File paths for cluster
-    file_path_hip = "E:/INM-7/SuperCBP/Data/HCP_R1_LR_VoxExtr_TianHip.hdf5"
-    file_path_roi = "E:/INM-7/SuperCBP/Data/HCP_R1_LR_ROIExtr_Power.hdf5"
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(CLUSTER_OUTPUT_PATH, exist_ok=True)
-    
-    # Run genetic algorithm
+    # Run the genetic algorithm
     best_chromosome, best_fitness = genetic_algorithm(
-        file_path_hip=file_path_hip,
-        file_path_roi=file_path_roi,
         pop_size=50,
         num_clusters=3,
         num_generations=100,
+        crossover_rate=0.8,
         mutation_rate=0.1,
         mutation_strength=5.0,
-        run_number=1
+        tournament_size=3
     )
     
-    logging.info("\nFinal Results:")
-    logging.info(f"Best fitness score: {best_fitness:.3f}")
-    logging.info(f"Best chromosome (cluster centers): {best_chromosome}")
+    print("\nFinal Results:")
+    print(f"Best fitness (AUC): {best_fitness:.4f}")
+    
