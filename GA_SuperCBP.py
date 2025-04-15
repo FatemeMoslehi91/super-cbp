@@ -1,21 +1,25 @@
+#!/usr/bin/env python3
 import numpy as np
 import pandas as pd
 import random
 import time
 from sklearn.cluster import KMeans
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score
 from scipy.stats import pearsonr
-
-
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.preprocessing import StandardScaler
+import warnings
 # Import helper function for loading data
 from helper_func import load_junifer_store
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # File paths
 hipp_store_name = "HCP_R1_LR_VoxExtr_TianHip.hdf5"  # Hippocampus data
 roi_store_name = "HCP_R1_LR_ROIExtr_Power.hdf5"     # ROI data
-data_path = "E:/INM-7/SuperCBP/Data"
-labels_path = "E:/INM-7/SuperCBP/Data/hcp_ya_395unrelated_info.csv"  # Gender labels
+data_path = "/home/fmoslehi/SuperCBP"
+labels_path = "/home/fmoslehi/SuperCBP/hcp_ya_395unrelated_info.csv"  # Gender labels
+
 
 
 def initialize_population(pop_size, num_clusters, brain_bounds):
@@ -124,8 +128,6 @@ def crossover(parent1, parent2, crossover_rate=0.8):
     :return: Tuple containing two offspring chromosomes.
     """
     # Create copies of parents
-    parent1 = np.array(parent1)
-    parent2 = np.array(parent2)
     offspring1 = parent1.copy()
     offspring2 = parent2.copy()
     
@@ -134,35 +136,30 @@ def crossover(parent1, parent2, crossover_rate=0.8):
         # Choose a random crossover point
         crossover_point = random.randint(1, len(parent1) - 1)
         
-        # Perform crossover (properly handle numpy arrays)
-        offspring1 = np.concatenate((parent1[:crossover_point], parent2[crossover_point:]))
-        offspring2 = np.concatenate((parent2[:crossover_point], parent1[crossover_point:]))
+        # Perform crossover using np.concatenate
+        offspring1 = np.concatenate([parent1[:crossover_point], parent2[crossover_point:]])
+        offspring2 = np.concatenate([parent2[:crossover_point], parent1[crossover_point:]])
     
     return offspring1, offspring2
 
-
-
-def mutation(chromosome, mutation_rate=0.1, mutation_strength=5.0, brain_bounds=None):
+def mutation(chromosome, mutation_rate=0.1, mutation_scale=0.1):
     """
-    Mutate a chromosome by shifting cluster centers.
+    Perform mutation on a chromosome.
+    
     :param chromosome: The chromosome to be mutated.
     :param mutation_rate: Probability of each gene being mutated.
-    :param mutation_strength: Scale of the mutation if using Gaussian mutation.
-    :param brain_bounds: Min and max coordinates (x, y, z) in brain space.
-                      Format: [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+    :param mutation_scale: Scale of the mutation if using Gaussian mutation.
     :return: Mutated chromosome.
-    
     """
+    # Create a copy of the chromosome
     mutated = chromosome.copy()
     
-    for i in range(0, len(chromosome), 3):
-        if np.random.random() < mutation_rate:
-            shifts = np.random.normal(0, mutation_strength, 3)
-            mutated[i:i+3] += shifts
-            
-            if brain_bounds is not None:
-                min_bound, max_bound = brain_bounds
-                mutated[i:i+3] = np.clip(mutated[i:i+3], min_bound, max_bound)
+    # Apply mutation to each gene based on mutation_rate
+    for i in range(len(mutated)):
+        if random.random() < mutation_rate:
+            # Add Gaussian noise to the gene
+            sigma = mutation_scale * abs(mutated[i]) if mutated[i] != 0 else mutation_scale
+            mutated[i] += random.gauss(0, sigma)
     
     return mutated
 
@@ -207,28 +204,50 @@ def calculate_cluster_time_series(vox_data, cluster_labels, n_clusters=3):
     
     return cluster_time_series
 
-def build_feature_matrix(cluster_time_series, roi_data):
+def build_feature_matrix(cluster_time_series, roi_data, subjects=None):
     """
     Build feature matrix from cluster and ROI time series correlations.
     
     :param cluster_time_series: Dictionary with subject IDs as keys and cluster time series as values.
     :param roi_data: Array of ROI time series of shape (n_subjects, n_timepoints, n_rois).
+    :param subjects: List of subjects in the same order as roi_data. If None, will use sorted keys from cluster_time_series.
     :return: Feature matrix of shape (n_subjects, n_clusters * n_rois).
     """
-    # Sort subject IDs for consistency
-    subject_ids = sorted(cluster_time_series.keys())
+    # Get subject IDs for consistency
+    if subjects is None:
+        subject_ids = sorted(cluster_time_series.keys())
+    else:
+        subject_ids = subjects
+        
     n_subjects = len(subject_ids)
     
     # Get dimensions
-    n_clusters = cluster_time_series[subject_ids[0]].shape[1]
+    n_clusters = next(iter(cluster_time_series.values())).shape[1]  # Get first item's cluster count
     _, _, n_rois = roi_data.shape
+    
+    print(f"Building feature matrix with {n_subjects} subjects, {n_clusters} clusters, {n_rois} ROIs")
     
     # Initialize feature matrix
     X = np.zeros((n_subjects, n_clusters * n_rois))
     
-    for i, subject_id in enumerate(subject_ids):
+    # Create a mapping from subject ID to index in roi_data
+    if subjects is not None:
+        subject_to_idx = {sid: i for i, sid in enumerate(subjects)}
+    else:
+        subject_to_idx = {sid: i for i, sid in enumerate(subject_ids)}
+    
+    for s_idx, subject_id in enumerate(subject_ids):
+        if subject_id not in cluster_time_series:
+            print(f"  Warning: Subject {subject_id} not found in cluster time series, skipping")
+            continue
+            
         cluster_ts = cluster_time_series[subject_id]
-        roi_ts = roi_data[i]
+        roi_idx = subject_to_idx.get(subject_id)
+        if roi_idx is None:
+            print(f"  Warning: Subject {subject_id} not found in ROI data, skipping")
+            continue
+            
+        roi_ts = roi_data[roi_idx]
         
         # Calculate correlations
         feat_idx = 0
@@ -242,15 +261,18 @@ def build_feature_matrix(cluster_time_series, roi_data):
                     corr, _ = pearsonr(c_signal, r_signal)
                     if np.isnan(corr):
                         corr = 0.0
-                except:
+                except Exception as e:
                     corr = 0.0
+                    print(f"  Error calculating correlation for subject {subject_id}: {str(e)}")
                 
-                X[i, feat_idx] = corr
+                X[s_idx, feat_idx] = corr
                 feat_idx += 1
+    
+    print(f"Feature matrix shape: {X.shape}")
     
     return X
 
-def evaluate_fitness(chromosome, vox_data, voxel_coords, roi_data, labels, num_clusters=3):
+def evaluate_fitness(chromosome, vox_data, voxel_coords, roi_data, labels, num_clusters=3, subjects=None, generation=None, chrom_idx=None):
     """
     Evaluate the fitness of a chromosome.
     
@@ -260,8 +282,17 @@ def evaluate_fitness(chromosome, vox_data, voxel_coords, roi_data, labels, num_c
     :param roi_data: Array of ROI time series.
     :param labels: Array of class labels (gender).
     :param num_clusters: Number of clusters.
+    :param subjects: List of subject IDs in the same order as roi_data.
+    :param generation: Current generation number (for printing)
+    :param chrom_idx: Chromosome index in the population (for printing)
     :return: Fitness score (AUC).
     """
+    # Print header if generation and chromosome info provided
+    if generation is not None and chrom_idx is not None:
+        print(f"\n{'='*60}")
+        print(f"Generation #{generation} | Chromosome #{chrom_idx}")
+        print(f"{'='*60}")
+    
     # Convert chromosome to cluster centers
     centers = decode_chromosome(chromosome, num_clusters)
     
@@ -270,9 +301,31 @@ def evaluate_fitness(chromosome, vox_data, voxel_coords, roi_data, labels, num_c
     for i, center in enumerate(centers):
         print(f"    Cluster {i+1}: {center}")
     
-    # Create KMeans model with these centers
-    kmeans = KMeans(n_clusters=num_clusters, init=centers, n_init=1)
-    cluster_labels = kmeans.fit_predict(voxel_coords)
+    # Use the chromosome centers directly for clustering
+    # Calculate distances to each center
+    distances = np.zeros((len(voxel_coords), num_clusters))
+    for i in range(num_clusters):
+        # Use weighted Euclidean distance with random weights
+        weights = np.random.uniform(0.8, 1.2, size=3)
+        diff = voxel_coords - centers[i]
+        distances[:, i] = np.sqrt(np.sum((diff * weights) ** 2, axis=1))
+    
+    # Assign each voxel to the nearest center
+    cluster_labels = np.argmin(distances, axis=1)
+    
+    # Try to avoid empty clusters
+    for i in range(num_clusters):
+        if np.sum(cluster_labels == i) == 0:
+            # Find the cluster with the most points
+            largest_cluster = np.argmax([np.sum(cluster_labels == j) for j in range(num_clusters)])
+            
+            # Find the points in the largest cluster that are closest to the empty cluster center
+            mask = cluster_labels == largest_cluster
+            subset_distances = np.sqrt(np.sum((voxel_coords[mask] - centers[i]) ** 2, axis=1))
+            
+            # Reassign some points to the empty cluster
+            idx_to_reassign = np.argsort(subset_distances)[:max(20, len(subset_distances) // 10)]
+            cluster_labels[np.where(mask)[0][idx_to_reassign]] = i
     
     # Print the number of voxels in each cluster
     cluster_counts = np.bincount(cluster_labels)
@@ -284,17 +337,46 @@ def evaluate_fitness(chromosome, vox_data, voxel_coords, roi_data, labels, num_c
     cluster_time_series = calculate_cluster_time_series(vox_data, cluster_labels, num_clusters)
     
     # Build feature matrix
-    X = build_feature_matrix(cluster_time_series, roi_data)
+    X = build_feature_matrix(cluster_time_series, roi_data, subjects)
+    
+    # Verify that X has no NaN values
+    if np.isnan(X).any():
+        print("  Warning: Feature matrix contains NaN values. Replacing with 0.")
+        X = np.nan_to_num(X)
+    
+    # Check for features with near-zero variance
+    feature_vars = np.var(X, axis=0)
+    low_var_indices = np.where(feature_vars < 1e-10)[0]
+    if len(low_var_indices) > 0:
+        print(f"  Removing {len(low_var_indices)} features with near-zero variance")
+        X = np.delete(X, low_var_indices, axis=1)
+    
+    # Feature Selection - Select better features using SelectKBest
+    n_features = min(50, X.shape[1])  # Maximum 50 features or fewer if fewer features exist
+    selector = SelectKBest(f_classif, k=n_features)
+    X_selected = selector.fit_transform(X, labels)
+    
+    # Standardize the data
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_selected)
     
     # Evaluate classification performance using cross-validation
-    model = LogisticRegression(max_iter=1000, random_state=42)
+    model = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=None,
+        min_samples_split=10,
+        random_state=42
+    )
+    
     try:
-        scores = cross_val_score(model, X, labels, cv=5, scoring='roc_auc')
+        scores = cross_val_score(model, X_scaled, labels, cv=5, scoring='roc_auc')
         auc = np.mean(scores)
         print(f"  Cross-validation AUC scores: {scores}")
+        if chrom_idx is not None:
+            print(f"  Chromosome {chrom_idx} fitness: {auc:.4f}")
     except Exception as e:
         print(f"  Error in evaluation: {str(e)}")
-        # If there's an error in evaluation, return a low fitness
+        # If there's an error in evaluation, return a low fitness score 
         scores = np.zeros(5)
         auc = 0.0
     
@@ -314,25 +396,76 @@ def load_data():
     roi_storage, roi_markers = load_junifer_store(roi_store_name, data_path)
     roi_df = roi_storage.read_df(feature_name=roi_markers[0])
     
-    # Convert to numpy array with shape (n_subjects, n_timepoints, n_rois)
+    # Get unique subjects from both datasets
+    hipp_subjects = set(vox_data.index.get_level_values('subject').unique())
     roi_subjects = roi_df.index.get_level_values('subject').unique()
-    time_points = len(roi_df.xs(roi_subjects[0], level='subject'))
+    print(f"Hippocampal data: {len(hipp_subjects)} subjects")
+    print(f"ROI data: {len(roi_subjects)} subjects")
+    
+    # Find common subjects to use for both datasets
+    common_subjects = sorted(list(hipp_subjects.intersection(roi_subjects)))
+    print(f"Common subjects: {len(common_subjects)}")
+    
+    # Filter vox_data to include only common subjects
+    vox_data = vox_data.loc[vox_data.index.get_level_values('subject').isin(common_subjects)]
+    
+    # Convert to numpy array with shape (n_subjects, n_timepoints, n_rois) for common subjects
+    time_points = len(roi_df.xs(common_subjects[0], level='subject'))
     n_rois = roi_df.shape[1]
     
-    roi_data = np.zeros((len(roi_subjects), time_points, n_rois))
-    for i, sid in enumerate(roi_subjects):
+    roi_data = np.zeros((len(common_subjects), time_points, n_rois))
+    for i, sid in enumerate(common_subjects):
         subj_data = roi_df.xs(sid, level='subject')
         roi_data[i] = subj_data.values
     
     print(f"Loaded ROI data: shape = {roi_data.shape}")
     
     print("\nLoading gender labels...")
-    df = pd.read_csv(labels_path)
-    n_subjects = len(roi_subjects)
-    labels = (df['Gender'].values == 'F').astype(int)[:n_subjects]
-    print(f"Loaded {len(labels)} gender labels")
+    try:
+        import os
+        if not os.path.exists(labels_path):
+            print(f"ERROR: Gender labels file not found at path: {labels_path}")
+            return None, None, None, None, None
+            
+        df = pd.read_csv(labels_path)
+        
+        if 'Subject' not in df.columns or 'Gender' not in df.columns:
+            print("ERROR: Gender labels file does not have the required columns (Subject, Gender).")
+            print(f"Available columns: {df.columns.tolist()}")
+            return None, None, None, None, None
+        
+        # Create mapping from subject ID to gender
+        subject_to_gender = {str(row['Subject']): 1 if row['Gender'] == 'F' else 0 
+                             for _, row in df.iterrows()}
+        
+        # Get gender labels for common subjects
+        labels = []
+        valid_subjects = []
+        
+        for sid in common_subjects:
+            if str(sid) in subject_to_gender:
+                labels.append(subject_to_gender[str(sid)])
+                valid_subjects.append(sid)
+            
+        print(f"Found gender labels for {len(valid_subjects)} out of {len(common_subjects)} common subjects")
+        print(f"Gender distribution: {labels.count(1)}/{len(labels)} females ({labels.count(1)/len(labels)*100:.1f}%)")
+        
+        # Update vox_data and roi_data to include only subjects with gender labels
+        vox_data = vox_data.loc[vox_data.index.get_level_values('subject').isin(valid_subjects)]
+        
+        # Rebuild roi_data for valid subjects only
+        new_roi_data = np.zeros((len(valid_subjects), time_points, n_rois))
+        for i, sid in enumerate(valid_subjects):
+            subj_data = roi_df.xs(sid, level='subject')
+            new_roi_data[i] = subj_data.values
+            
+        roi_data = new_roi_data
+        
+    except Exception as e:
+        print(f"Error loading gender labels: {str(e)}")
+        return None, None, None, None, None
     
-    return vox_data, voxel_coords, roi_data, labels
+    return vox_data, voxel_coords, roi_data, np.array(labels), valid_subjects
 
 def genetic_algorithm(
     pop_size,
@@ -340,10 +473,9 @@ def genetic_algorithm(
     num_generations,
     crossover_rate,
     mutation_rate,
-    mutation_strength,
+    mutation_scale,
     tournament_size
 ):
-    
     """
     Run the genetic algorithm to optimize cluster centers.
     
@@ -352,12 +484,17 @@ def genetic_algorithm(
     :param num_generations: Number of generations to run.
     :param crossover_rate: Probability of crossover.
     :param mutation_rate: Probability of mutation for each gene.
-    :param mutation_strength: Scale of mutation.
+    :param mutation_scale: Scale of mutation.
     :param tournament_size: Size of tournament for selection.
     :return: Best chromosome and its fitness.
     """
     # Load data
-    vox_data, voxel_coords, roi_data, labels = load_data()
+    vox_data, voxel_coords, roi_data, labels, valid_subjects = load_data()
+    
+    # Check if data is loaded correctly
+    if vox_data is None:
+        print("Error loading data. Cannot continue.")
+        return None, 0.0
     
     # Get brain bounds for initialization
     brain_bounds = get_brain_bounds(hipp_store_name, data_path)
@@ -370,25 +507,23 @@ def genetic_algorithm(
     print("Evaluating initial population...")
     fitness_scores = []
     for i, chrom in enumerate(population):
-        print("\n==================================================")
-        print(f" Generation #1 | Chromosome #{i+1}")
-        print("==================================================")
-        fitness = evaluate_fitness(chrom, vox_data, voxel_coords, roi_data, labels, num_clusters)
+        fitness = evaluate_fitness(chrom, vox_data, voxel_coords, roi_data, labels, num_clusters, valid_subjects, 
+                                 generation=1, chrom_idx=i+1)
         fitness_scores.append(fitness)
-        print(f"  Chromosome {i+1} fitness: {fitness:.4f}")
     
     best_fitness = max(fitness_scores)
     best_idx = fitness_scores.index(best_fitness)
     best_chromosome = population[best_idx]
     
-    print(f"\nInitial best fitness: {best_fitness:.4f} (Chromosome {best_idx+1})")
+    print(f"Initial best fitness: {best_fitness:.4f} (Chromosome {best_idx+1})")
     
     # Main GA loop
     for generation in range(num_generations):
-        print(f"\n==================================================")
-        print(f" GENERATION {generation+1}/{num_generations}")
-        print("==================================================")
         start_time = time.time()
+        
+        print(f"\n{'='*60}")
+        print(f" GENERATION {generation+1}/{num_generations}")
+        print(f"{'='*60}")
         
         # Create new population through selection, crossover, and mutation
         new_population = []
@@ -407,8 +542,8 @@ def genetic_algorithm(
                 offspring1, offspring2 = crossover(parents[0], parents[1], crossover_rate)
                 
                 # Perform mutation
-                offspring1 = mutation(offspring1, mutation_rate, mutation_strength)
-                offspring2 = mutation(offspring2, mutation_rate, mutation_strength)
+                offspring1 = mutation(offspring1, mutation_rate, mutation_scale)
+                offspring2 = mutation(offspring2, mutation_rate, mutation_scale)
                 
                 # Add to new population
                 new_population.append(offspring1)
@@ -422,12 +557,9 @@ def genetic_algorithm(
         print(f"Evaluating population for generation {generation+1}...")
         fitness_scores = []
         for i, chrom in enumerate(population):
-            print("\n==================================================")
-            print(f" Generation #{generation+1} | Chromosome #{i+1}")
-            print("==================================================")
-            fitness = evaluate_fitness(chrom, vox_data, voxel_coords, roi_data, labels, num_clusters)
+            fitness = evaluate_fitness(chrom, vox_data, voxel_coords, roi_data, labels, num_clusters, 
+                                     valid_subjects, generation=generation+1, chrom_idx=i+1)
             fitness_scores.append(fitness)
-            print(f"  Chromosome {i+1} fitness: {fitness:.4f}")
         
         # Update best individual
         current_best_fitness = max(fitness_scores)
@@ -436,39 +568,124 @@ def genetic_algorithm(
         if current_best_fitness > best_fitness:
             best_fitness = current_best_fitness
             best_chromosome = population[current_best_idx]
-            print(f"\nNew best solution found! Chromosome {current_best_idx+1} with fitness {best_fitness:.4f}")
+            print(f"New best solution found! Chromosome {current_best_idx+1} with fitness {best_fitness:.4f}")
         
         # Print generation statistics
         generation_time = time.time() - start_time
-        print(f"\nGeneration {generation+1} completed in {generation_time:.2f} seconds")
+        print(f"Generation {generation+1} completed in {generation_time:.2f} seconds")
         print(f"Best fitness: {best_fitness:.4f}")
         print(f"Average fitness: {np.mean(fitness_scores):.4f}")
     
-    print("\n==================================================")
-    print(" GENETIC ALGORITHM COMPLETED")
-    print("==================================================")
+    print("\nGenetic algorithm completed!")
     print(f"Best fitness achieved: {best_fitness:.4f}")
     
     # Decode the best chromosome into cluster centers
     best_centers = decode_chromosome(best_chromosome, num_clusters)
-    print("\nBest cluster centers:")
+    print("Best cluster centers:")
     for i, center in enumerate(best_centers):
         print(f"Cluster {i+1}: {center}")
     
+    # Save results to CSV file
+    save_results(best_chromosome, best_fitness, num_clusters, valid_subjects, voxel_coords, vox_data, roi_data, labels)
+    
     return best_chromosome, best_fitness
+
+def save_results(chromosome, fitness, num_clusters, subjects, voxel_coords, vox_data, roi_data, labels):
+    """
+    Save the results of the genetic algorithm.
+    
+    :param chromosome: Best chromosome found.
+    :param fitness: Fitness of the best chromosome.
+    :param num_clusters: Number of clusters.
+    :param subjects: List of subject IDs.
+    :param voxel_coords: Voxel coordinates.
+    :param vox_data: Voxel time series data.
+    :param roi_data: ROI time series data.
+    :param labels: Gender labels.
+    """
+    print("\nSaving results...")
+    
+    # Create directory if it doesn't exist
+    import os
+    os.makedirs("clustering_results", exist_ok=True)
+    
+    # Decode chromosome to get cluster centers
+    centers = decode_chromosome(chromosome, num_clusters)
+    
+    # Assign voxels to clusters
+    distances = np.zeros((len(voxel_coords), num_clusters))
+    for i in range(num_clusters):
+        diff = voxel_coords - centers[i]
+        distances[:, i] = np.sqrt(np.sum(diff ** 2, axis=1))
+    cluster_labels = np.argmin(distances, axis=1)
+    
+    # Calculate cluster time series
+    cluster_time_series = calculate_cluster_time_series(vox_data, cluster_labels, num_clusters)
+    
+    # Build feature matrix
+    X = build_feature_matrix(cluster_time_series, roi_data, subjects)
+    
+    # Apply feature selection
+    selector = SelectKBest(f_classif, k=min(50, X.shape[1]))
+    X_selected = selector.fit_transform(X, labels)
+    
+    # Get selected feature indices
+    selected_indices = selector.get_support(indices=True)
+    
+    # Create column names
+    column_names = []
+    for c in range(num_clusters):
+        for r in range(roi_data.shape[2]):
+            column_names.append(f"Cluster_{c+1}_ROI_{r+1}")
+    
+    # Create selected column names
+    selected_columns = [column_names[i] for i in selected_indices]
+    
+    # Save feature matrix to CSV with subject IDs
+    df = pd.DataFrame(X_selected, columns=selected_columns)
+    df.insert(0, "Subject", subjects)
+    df.insert(1, "Gender", labels)
+    df.to_csv("clustering_results/feature_matrix.csv", index=False)
+    
+    print(f"Results saved to clustering_results/feature_matrix.csv")
+    print(f"Feature matrix shape: {X_selected.shape}")
+    print(f"Selected {len(selected_columns)} features")
+    
+    # Save best chromosome
+    np.save("clustering_results/best_chromosome.npy", chromosome)
+    
+    # Save a summary report
+    with open("clustering_results/summary.txt", "w") as f:
+        f.write(f"Best fitness (AUC): {fitness:.4f}\n")
+        f.write(f"Number of clusters: {num_clusters}\n")
+        f.write(f"Number of subjects: {len(subjects)}\n")
+        f.write(f"Gender distribution: {labels.sum()}/{len(labels)} females ({labels.sum()/len(labels)*100:.1f}%)\n\n")
+        
+        f.write("Best cluster centers:\n")
+        for i, center in enumerate(centers):
+            f.write(f"Cluster {i+1}: {center}\n")
+        
+        f.write(f"\nVoxels per cluster:\n")
+        cluster_counts = np.bincount(cluster_labels)
+        for i, count in enumerate(cluster_counts):
+            f.write(f"Cluster {i+1}: {count} voxels\n")
+            
+    print(f"Summary report saved to clustering_results/summary.txt")
 
 if __name__ == "__main__":
     # Run the genetic algorithm
     best_chromosome, best_fitness = genetic_algorithm(
-        pop_size=50,
+        pop_size=30,                
         num_clusters=3,
-        num_generations=100,
+        num_generations=50,         
         crossover_rate=0.8,
         mutation_rate=0.1,
-        mutation_strength=5.0,
+        mutation_scale=1.0,        
         tournament_size=3
     )
     
     print("\nFinal Results:")
     print(f"Best fitness (AUC): {best_fitness:.4f}")
     
+    # Best chromosome is already saved in save_results function
+    print("Best chromosome saved to 'clustering_results/best_chromosome.npy'") 
