@@ -3,8 +3,6 @@ import numpy as np
 import pandas as pd
 import random
 import time
-import matplotlib.pyplot as plt
-from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score
 from scipy.stats import pearsonr
