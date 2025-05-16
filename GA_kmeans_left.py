@@ -56,12 +56,13 @@ def initialize_population(pop_size, num_clusters, brain_bounds):
     
     return population
 
-def get_brain_bounds(storage_name="HCP_R1_LR_VoxExtr_TianHip.hdf5", data_path="E:/INM-7/SuperCBP/Data"):
+def get_brain_bounds(storage_name="HCP_R1_LR_VoxExtr_TianHip.hdf5", data_path="E:/INM-7/SuperCBP/Data", padding=20):
     """
     Extract brain coordinate bounds from the HDF5 storage file and add 20mm padding in all directions.
     
     :param storage_name: Name of the HDF5 file
     :param data_path: Path to the data directory
+    :param padding: Padding in mm to adjust voxel location bounds
     :returns: List of [min, max] bounds for each dimension [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
     """
     # Load the storage file
@@ -79,13 +80,16 @@ def get_brain_bounds(storage_name="HCP_R1_LR_VoxExtr_TianHip.hdf5", data_path="E
     y_coords = coordinates[:, 1]
     z_coords = coordinates[:, 2]
     
-    # Calculate bounds for each dimension with 20mm padding
-    padding = 20  # 20mm padding
+    # Calculate bounds for each dimension with padding    
     brain_bounds = [
-        [np.min(x_coords) - padding, np.max(x_coords) + padding],  # x bounds
-        [np.min(y_coords) - padding, np.max(y_coords) + padding],  # y bounds
-        [np.min(z_coords) - padding, np.max(z_coords) + padding]   # z bounds
+        [np.min(x_coords), np.max(x_coords)],  # x bounds
+        [np.min(y_coords), np.max(y_coords)],  # y bounds
+        [np.min(z_coords), np.max(z_coords)]   # z bounds
     ]
+
+    # apply padding
+    brain_bounds[brain_bounds < 0] = brain_bounds[brain_bounds < 0] - padding
+    brain_bounds[brain_bounds > 0] = brain_bounds[brain_bounds > 0] + padding
     
     print("Brain bounds extracted from voxel coordinates (with 20mm padding):")
     print(f"X range: [{brain_bounds[0][0]}, {brain_bounds[0][1]}]")
