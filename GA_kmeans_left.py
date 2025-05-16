@@ -88,8 +88,9 @@ def get_brain_bounds(storage_name="HCP_R1_LR_VoxExtr_TianHip.hdf5", data_path="E
     ]
 
     # apply padding
-    brain_bounds[brain_bounds < 0] = brain_bounds[brain_bounds < 0] - padding
-    brain_bounds[brain_bounds > 0] = brain_bounds[brain_bounds > 0] + padding
+    if padding is not None and padding > 0:
+        brain_bounds[brain_bounds < 0] = brain_bounds[brain_bounds < 0] - padding
+        brain_bounds[brain_bounds > 0] = brain_bounds[brain_bounds > 0] + padding
     
     print("Brain bounds extracted from voxel coordinates (with 20mm padding):")
     print(f"X range: [{brain_bounds[0][0]}, {brain_bounds[0][1]}]")
