@@ -349,17 +349,12 @@ def evaluate_fitness(chromosome, vox_data, voxel_coords, roi_data, labels, num_c
     for i, center in enumerate(centers):
         print(f"    Cluster {i+1}: {center}")
     
-    # Initialize K-means with the chromosome centers as initial centers
-    kmeans = KMeans(
-        n_clusters=num_clusters,
-        init=centers,  # Use chromosome centers as initial centers
-        n_init=1,      # Only one initialization since we're providing centers
-        max_iter=100,  # Maximum iterations
-        random_state=42
-    )
-    
-    # Fit K-means to voxel coordinates
-    cluster_labels = kmeans.fit_predict(voxel_coords)
+    # Initialize K-means with the chromosome centers as initial centers    
+    kmeans = KMeans(n_clusters=num_centers, n_init='auto')
+    # Set the cluster centers manually
+    kmeans.cluster_centers_ = centers
+    # get assignments
+    cluster_labels = kmeans.predict(voxel_coords)    
     
     # Get final cluster centers
     final_centers = kmeans.cluster_centers_
