@@ -166,10 +166,6 @@ def mutation(chromosome, mutation_rate, mutation_scale):
             # Add Gaussian noise to the gene
             sigma = mutation_scale * abs(mutated[i]) if mutated[i] != 0 else mutation_scale
             mutated[i] += random.gauss(0, sigma)
-            
-            # If this is an x-coordinate (every third element), ensure it's negative
-            if i % 3 == 0:  # x-coordinate
-                mutated[i] = -abs(mutated[i])
     
     return mutated
 
