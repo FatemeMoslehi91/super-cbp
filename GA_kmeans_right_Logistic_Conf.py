@@ -6,7 +6,7 @@ import time
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr 
 import warnings
 # Import helper function for loading data
 from helper_func import load_junifer_store
