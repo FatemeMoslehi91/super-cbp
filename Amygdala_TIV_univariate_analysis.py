@@ -121,7 +121,7 @@ def remove_tiv_with_julearn(X, tiv_values, feature_names):
     X : array, shape (n_subjects, n_features)
     tiv_values : array, shape (n_subjects,)
     feature_names : list of str, length n_features
-
+ 
     Returns
     -------
     X_resid : array, shape (n_subjects, n_features) -- TIV removed
